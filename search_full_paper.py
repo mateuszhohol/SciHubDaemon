@@ -195,11 +195,8 @@ class SearchFullPaperApp:
         btn_frame = ttk.Frame(self.root)
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        self.extract_btn = ttk.Button(btn_frame, text="1. Extract DOIs", command=self._extract_dois)
-        self.extract_btn.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.download_btn = ttk.Button(btn_frame, text="2. Download All", command=self._start_download)
-        self.download_btn.pack(side=tk.LEFT, padx=5)
+        self.download_btn = ttk.Button(btn_frame, text="Download All", command=self._start_download)
+        self.download_btn.pack(side=tk.LEFT, padx=(0, 5))
 
         self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self._stop_download, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)

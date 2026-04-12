@@ -14,7 +14,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo Building .exe...
-pyinstaller --name "Researchers Best Friend" --onefile --windowed --noconfirm search_full_paper.py
+pyinstaller --name "Researchers Best Friend" --onefile --windowed --icon=icon.ico --noconfirm search_full_paper.py
 if %errorlevel% neq 0 (
     echo ERROR: Build failed.
     pause
