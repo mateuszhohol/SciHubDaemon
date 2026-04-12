@@ -9,6 +9,7 @@ import re
 import os
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 from urllib.parse import urljoin
@@ -51,6 +52,12 @@ HEADERS = {
     )
 }
 
+# Timeout as (connect, read) tuple — prevents hanging on stalled connections
+REQUEST_TIMEOUT = (10, 20)
+PDF_DOWNLOAD_TIMEOUT = (10, 30)
+# Hard timeout per DOI — kills the attempt if it exceeds this (seconds)
+HARD_TIMEOUT_PER_ITEM = 90
+
 
 def download_paper(doi: str, output_dir: str, scihub_url: str, log_callback=None) -> bool:
     """Download a single paper by DOI from Sci-Hub. Returns True on success."""
@@ -66,7 +73,7 @@ def download_paper(doi: str, output_dir: str, scihub_url: str, log_callback=None
     log(f"  Requesting: {url}")
 
     try:
-        resp = session.get(url, timeout=30, allow_redirects=True)
+        resp = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
         resp.raise_for_status()
     except requests.RequestException as e:
         log(f"  ERROR: Could not reach Sci-Hub: {e}")
@@ -102,7 +109,6 @@ def download_paper(doi: str, output_dir: str, scihub_url: str, log_callback=None
                 break
 
     if not pdf_url:
-        # Check if page says "article not found"
         text_lower = resp.text.lower()
         if "not found" in text_lower or "статья не найдена" in text_lower:
             log("  Article not found on Sci-Hub.")
@@ -119,7 +125,7 @@ def download_paper(doi: str, output_dir: str, scihub_url: str, log_callback=None
     log(f"  Downloading PDF: {pdf_url[:80]}...")
 
     try:
-        pdf_resp = session.get(pdf_url, timeout=60, stream=True)
+        pdf_resp = session.get(pdf_url, timeout=PDF_DOWNLOAD_TIMEOUT, stream=True)
         pdf_resp.raise_for_status()
     except requests.RequestException as e:
         log(f"  ERROR downloading PDF: {e}")
@@ -158,7 +164,7 @@ class SciHubDaemonApp:
         self.root.minsize(600, 500)
 
         self.downloading = False
-        self.stop_requested = False
+        self.stop_event = threading.Event()
         self.failed_dois = []
 
         self._build_ui()
@@ -282,7 +288,6 @@ class SciHubDaemonApp:
         dois_to_retry = list(self.failed_dois)
         self.failed_dois.clear()
 
-        # Update DOI listbox to show only retried items
         self.doi_listbox.delete(0, tk.END)
         for doi in dois_to_retry:
             self.doi_listbox.insert(tk.END, doi)
@@ -294,7 +299,7 @@ class SciHubDaemonApp:
         os.makedirs(output_dir, exist_ok=True)
 
         self.downloading = True
-        self.stop_requested = False
+        self.stop_event.clear()
         self.download_btn.configure(state=tk.DISABLED)
         self.retry_btn.configure(state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
@@ -303,8 +308,8 @@ class SciHubDaemonApp:
         thread.start()
 
     def _stop_download(self):
-        self.stop_requested = True
-        self._log("Stop requested, finishing current download...")
+        self.stop_event.set()
+        self._log("Stop requested — skipping current item...")
 
     def _download_thread(self, dois: list[str], output_dir: str):
         total = len(dois)
@@ -316,9 +321,11 @@ class SciHubDaemonApp:
 
         self.root.after(0, lambda: self.progress_bar.configure(maximum=total, value=0))
 
+        # Use a single-worker pool so we can enforce hard timeouts per item
+        executor = ThreadPoolExecutor(max_workers=1)
+
         for i, doi in enumerate(dois):
-            if self.stop_requested:
-                # Treat remaining DOIs as failed so they can be retried
+            if self.stop_event.is_set():
                 failed_dois.extend(dois[i:])
                 failed += len(dois) - i
                 self._log(f"\nStopped by user after {i}/{total} papers.")
@@ -327,7 +334,21 @@ class SciHubDaemonApp:
             self._log(f"\n[{i+1}/{total}] DOI: {doi}")
             self.root.after(0, lambda v=i+1: self.progress_var.set(f"Downloading {v}/{total}..."))
 
-            ok = download_paper(doi, output_dir, scihub_url, log_callback=self._log)
+            # Submit download to executor with hard timeout
+            future = executor.submit(
+                download_paper, doi, output_dir, scihub_url, log_callback=self._log
+            )
+
+            try:
+                ok = future.result(timeout=HARD_TIMEOUT_PER_ITEM)
+            except FuturesTimeoutError:
+                future.cancel()
+                self._log(f"  TIMEOUT: Download exceeded {HARD_TIMEOUT_PER_ITEM}s — skipping.")
+                ok = False
+            except Exception as e:
+                self._log(f"  UNEXPECTED ERROR: {e}")
+                ok = False
+
             if ok:
                 success += 1
             else:
@@ -336,13 +357,27 @@ class SciHubDaemonApp:
 
             self.root.after(0, lambda v=i+1: self.progress_bar.configure(value=v))
 
-            # Delay between requests
-            if i < total - 1 and not self.stop_requested:
+            # Check stop again before delay
+            if self.stop_event.is_set():
+                remaining = dois[i+1:]
+                if remaining:
+                    failed_dois.extend(remaining)
+                    failed += len(remaining)
+                    self._log(f"\nStopped by user after {i+1}/{total} papers.")
+                break
+
+            # Delay between requests (interruptible)
+            if i < total - 1:
                 self._log(f"  Waiting {delay}s before next request...")
-                for _ in range(delay):
-                    if self.stop_requested:
-                        break
-                    time.sleep(1)
+                if self.stop_event.wait(timeout=delay):
+                    # Stop was requested during delay
+                    remaining = dois[i+1:]
+                    failed_dois.extend(remaining)
+                    failed += len(remaining)
+                    self._log(f"\nStopped by user after {i+1}/{total} papers.")
+                    break
+
+        executor.shutdown(wait=False)
 
         self.failed_dois = failed_dois
 
