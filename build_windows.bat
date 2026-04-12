@@ -14,7 +14,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo Building .exe...
-pyinstaller --name "SciHubDaemon" --onefile --windowed --icon=icon.ico --noconfirm scihubdaemon.py
+pyinstaller --name "SciHubDaemon" --windowed --icon=icon.ico --noconfirm scihubdaemon.py
 if %errorlevel% neq 0 (
     echo ERROR: Build failed.
     pause
@@ -24,6 +24,6 @@ if %errorlevel% neq 0 (
 echo.
 echo ============================================
 echo  BUILD COMPLETE!
-echo  Your .exe is in: dist\SciHubDaemon.exe
+echo  Your app is in: dist\SciHubDaemon\
 echo ============================================
 pause

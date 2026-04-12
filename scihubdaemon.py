@@ -5,6 +5,8 @@ SciHubDaemon - Batch DOI extractor and Sci-Hub downloader.
 Paste bibliographic descriptions, extract DOIs, download full papers from Sci-Hub.
 """
 
+VERSION = "2.0.2"
+
 import re
 import os
 import time
@@ -159,13 +161,14 @@ def download_paper(doi: str, output_dir: str, scihub_url: str, log_callback=None
 class SciHubDaemonApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("SciHubDaemon")
+        self.root.title(f"SciHubDaemon v{VERSION}")
         self.root.geometry("800x700")
         self.root.minsize(600, 500)
 
         self.downloading = False
         self.stop_event = threading.Event()
         self.failed_dois = []
+        self._last_input_hash = None  # tracks whether input text changed
 
         self._build_ui()
 
@@ -255,6 +258,7 @@ class SciHubDaemonApp:
 
     def _extract_dois(self):
         text = self.text_input.get("1.0", tk.END)
+        self._last_input_hash = hash(text)
         dois = extract_dois(text)
 
         self.doi_listbox.delete(0, tk.END)
@@ -266,8 +270,14 @@ class SciHubDaemonApp:
             self._log("No DOIs found. Make sure your text contains DOIs (e.g., 10.1234/...).")
         self.progress_var.set(f"{len(dois)} DOI(s) found")
 
+    def _input_changed(self) -> bool:
+        """Check if the input text has changed since last extraction."""
+        current_hash = hash(self.text_input.get("1.0", tk.END))
+        return current_hash != self._last_input_hash
+
     def _start_download(self):
-        if self.doi_listbox.size() == 0:
+        # Always re-extract if input text changed or DOI list is empty
+        if self._input_changed() or self.doi_listbox.size() == 0:
             self._extract_dois()
             if self.doi_listbox.size() == 0:
                 messagebox.showwarning("No DOIs", "No DOIs found in the input text.")
