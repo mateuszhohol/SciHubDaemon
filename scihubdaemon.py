@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SearchFullPaper - Batch DOI extractor and Sci-Hub downloader.
+SciHubDaemon - Batch DOI extractor and Sci-Hub downloader.
 
 Paste bibliographic descriptions, extract DOIs, download full papers from Sci-Hub.
 """
@@ -150,15 +150,16 @@ def download_paper(doi: str, output_dir: str, scihub_url: str, log_callback=None
 
 # --- GUI Application ---
 
-class SearchFullPaperApp:
+class SciHubDaemonApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Researcher's Best Friend")
+        self.root.title("SciHubDaemon")
         self.root.geometry("800x700")
         self.root.minsize(600, 500)
 
         self.downloading = False
         self.stop_requested = False
+        self.failed_dois = []
 
         self._build_ui()
 
@@ -197,6 +198,9 @@ class SearchFullPaperApp:
 
         self.download_btn = ttk.Button(btn_frame, text="Download All", command=self._start_download)
         self.download_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.retry_btn = ttk.Button(btn_frame, text="Retry Failed", command=self._retry_failed, state=tk.DISABLED)
+        self.retry_btn.pack(side=tk.LEFT, padx=5)
 
         self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self._stop_download, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
@@ -258,32 +262,55 @@ class SearchFullPaperApp:
 
     def _start_download(self):
         if self.doi_listbox.size() == 0:
-            # Try extracting first
             self._extract_dois()
             if self.doi_listbox.size() == 0:
                 messagebox.showwarning("No DOIs", "No DOIs found in the input text.")
                 return
 
+        dois = [self.doi_listbox.get(i) for i in range(self.doi_listbox.size())]
+        self._run_download(dois)
+
+    def _retry_failed(self):
+        if not self.failed_dois:
+            messagebox.showinfo("Nothing to retry", "No failed downloads to retry.")
+            return
+
+        self._log(f"\n{'='*50}")
+        self._log(f"RETRYING {len(self.failed_dois)} failed DOI(s)...")
+        self._log(f"{'='*50}")
+
+        dois_to_retry = list(self.failed_dois)
+        self.failed_dois.clear()
+
+        # Update DOI listbox to show only retried items
+        self.doi_listbox.delete(0, tk.END)
+        for doi in dois_to_retry:
+            self.doi_listbox.insert(tk.END, doi)
+
+        self._run_download(dois_to_retry)
+
+    def _run_download(self, dois: list[str]):
         output_dir = self.output_var.get()
         os.makedirs(output_dir, exist_ok=True)
 
         self.downloading = True
         self.stop_requested = False
         self.download_btn.configure(state=tk.DISABLED)
+        self.retry_btn.configure(state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
 
-        thread = threading.Thread(target=self._download_thread, args=(output_dir,), daemon=True)
+        thread = threading.Thread(target=self._download_thread, args=(dois, output_dir), daemon=True)
         thread.start()
 
     def _stop_download(self):
         self.stop_requested = True
         self._log("Stop requested, finishing current download...")
 
-    def _download_thread(self, output_dir: str):
-        dois = [self.doi_listbox.get(i) for i in range(self.doi_listbox.size())]
+    def _download_thread(self, dois: list[str], output_dir: str):
         total = len(dois)
         success = 0
         failed = 0
+        failed_dois = []
         scihub_url = self.scihub_var.get().rstrip("/")
         delay = max(1, int(self.delay_var.get()))
 
@@ -291,6 +318,9 @@ class SearchFullPaperApp:
 
         for i, doi in enumerate(dois):
             if self.stop_requested:
+                # Treat remaining DOIs as failed so they can be retried
+                failed_dois.extend(dois[i:])
+                failed += len(dois) - i
                 self._log(f"\nStopped by user after {i}/{total} papers.")
                 break
 
@@ -302,10 +332,11 @@ class SearchFullPaperApp:
                 success += 1
             else:
                 failed += 1
+                failed_dois.append(doi)
 
             self.root.after(0, lambda v=i+1: self.progress_bar.configure(value=v))
 
-            # Delay between requests to be polite
+            # Delay between requests
             if i < total - 1 and not self.stop_requested:
                 self._log(f"  Waiting {delay}s before next request...")
                 for _ in range(delay):
@@ -313,20 +344,32 @@ class SearchFullPaperApp:
                         break
                     time.sleep(1)
 
+        self.failed_dois = failed_dois
+
         self._log(f"\nDone! Success: {success}, Failed: {failed}, Total: {total}")
         self._log(f"Files saved to: {output_dir}")
+        if failed_dois:
+            self._log(f"\nFailed DOIs ({len(failed_dois)}):")
+            for doi in failed_dois:
+                self._log(f"  - {doi}")
+            self._log('Click "Retry Failed" to try again.')
 
-        self.root.after(0, lambda: self.progress_var.set(
-            f"Done: {success} downloaded, {failed} failed"
-        ))
-        self.root.after(0, lambda: self.download_btn.configure(state=tk.NORMAL))
-        self.root.after(0, lambda: self.stop_btn.configure(state=tk.DISABLED))
+        def _finish():
+            self.progress_var.set(f"Done: {success} downloaded, {failed} failed")
+            self.download_btn.configure(state=tk.NORMAL)
+            self.stop_btn.configure(state=tk.DISABLED)
+            if failed_dois:
+                self.retry_btn.configure(state=tk.NORMAL)
+            else:
+                self.retry_btn.configure(state=tk.DISABLED)
+
+        self.root.after(0, _finish)
         self.downloading = False
 
 
 def main():
     root = tk.Tk()
-    app = SearchFullPaperApp(root)
+    app = SciHubDaemonApp(root)
     root.mainloop()
 
 

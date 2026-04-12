@@ -1,6 +1,6 @@
 @echo off
 echo ============================================
-echo  Building Researcher's Best Friend for Windows
+echo  Building SciHubDaemon for Windows
 echo ============================================
 echo.
 
@@ -14,7 +14,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo Building .exe...
-pyinstaller --name "Researchers Best Friend" --onefile --windowed --icon=icon.ico --noconfirm search_full_paper.py
+pyinstaller --name "SciHubDaemon" --onefile --windowed --icon=icon.ico --noconfirm scihubdaemon.py
 if %errorlevel% neq 0 (
     echo ERROR: Build failed.
     pause
@@ -24,6 +24,6 @@ if %errorlevel% neq 0 (
 echo.
 echo ============================================
 echo  BUILD COMPLETE!
-echo  Your .exe is in: dist\Researchers Best Friend.exe
+echo  Your .exe is in: dist\SciHubDaemon.exe
 echo ============================================
 pause
