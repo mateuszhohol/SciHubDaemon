@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-SciHubDaemon - Batch DOI extractor and Sci-Hub downloader.
+SciHubDaemon - Batch DOI extractor and paper downloader.
 
-Paste bibliographic descriptions, extract DOIs, download full papers from Sci-Hub.
+Paste bibliographic descriptions, extract DOIs, download full papers. Legal
+open-access copies are looked up first via OpenAlex, with Sci-Hub as fallback.
 """
 
-VERSION = "2.0.3"
+VERSION = "2.1.0"
 
 import re
 import os
@@ -71,7 +72,7 @@ def extract_dois(text: str) -> list[str]:
     return dois
 
 
-# --- Sci-Hub Downloader ---
+# --- Networking ---
 
 SCIHUB_URLS = [
     "https://sci-hub.pl",
@@ -89,11 +90,135 @@ HEADERS = {
 # Timeout as (connect, read) tuple — prevents hanging on stalled connections
 REQUEST_TIMEOUT = (10, 20)
 PDF_DOWNLOAD_TIMEOUT = (10, 30)
-# Hard timeout per DOI — kills the attempt if it exceeds this (seconds)
-HARD_TIMEOUT_PER_ITEM = 90
+# Hard timeout per DOI — kills the attempt if it exceeds this (seconds).
+# Covers the whole chain: OpenAlex lookup, each open-access candidate, Sci-Hub.
+HARD_TIMEOUT_PER_ITEM = 120
 
 
-def download_paper(doi: str, output_dir: str, scihub_url: str, log_callback=None) -> bool:
+def _save_pdf(session, pdf_url: str, filepath: str, log) -> bool:
+    """Download `pdf_url` to `filepath`, keeping the file only if it's a PDF."""
+    try:
+        resp = session.get(
+            pdf_url, timeout=PDF_DOWNLOAD_TIMEOUT, stream=True, allow_redirects=True
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log(f"  ERROR downloading PDF: {e}")
+        return False
+
+    with open(filepath, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    # An error page, CAPTCHA or repository landing page is easily bigger than
+    # 1 KB, so size alone can't tell us this is a PDF — check the file
+    # signature and drop anything else, rather than leaving a broken .pdf that
+    # looks downloaded.
+    with open(filepath, "rb") as f:
+        header = f.read(5)
+    file_size = os.path.getsize(filepath)
+
+    if header != b"%PDF-":
+        log("  Not a PDF (error or landing page) — discarded.")
+        os.remove(filepath)
+        return False
+
+    if file_size < 1024:
+        log(f"  File very small ({file_size} bytes) — discarded.")
+        os.remove(filepath)
+        return False
+
+    log(f"  Saved: {os.path.basename(filepath)} ({file_size / 1024:.0f} KB)")
+    return True
+
+
+# --- Open Access Resolver ---
+
+OPENALEX_API = "https://api.openalex.org/works/doi:"
+# OpenAlex answers anonymous requests from a shared pool; supplying a contact
+# address moves you to the faster "polite" pool. Blank by design — put your own
+# address here if you want that speedup.
+OPENALEX_CONTACT = ""
+OPENALEX_TIMEOUT = (10, 20)
+
+
+def lookup_open_access(doi: str, session, log) -> dict | None:
+    """Ask OpenAlex whether a legal free copy of `doi` exists.
+
+    Returns metadata plus `pdf_urls` (direct PDF links, best first) and
+    `landing_url`. Returns None when OpenAlex has no record of the DOI.
+    """
+    params = {"mailto": OPENALEX_CONTACT} if OPENALEX_CONTACT else {}
+    try:
+        resp = session.get(
+            OPENALEX_API + quote(doi, safe="/()"),
+            params=params,
+            timeout=OPENALEX_TIMEOUT,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        work = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        log(f"  [OA] Lookup failed: {e}")
+        return None
+
+    oa = work.get("open_access") or {}
+    best = work.get("best_oa_location") or {}
+
+    # Commercial publishers frequently refuse automated fetches — Wiley answers
+    # 403, Springer serves an HTML bot-check as 200 — while institutional
+    # repositories hand over the PDF directly. So try repositories first, even
+    # when they only hold the accepted manuscript: a version you can actually
+    # retrieve beats a published one behind a bot wall.
+    repo_urls, journal_urls = [], []
+    for loc in work.get("locations") or []:
+        pdf = loc.get("pdf_url")
+        if not pdf or not loc.get("is_oa"):
+            continue
+        source_type = ((loc.get("source") or {}).get("type") or "").lower()
+        (repo_urls if source_type == "repository" else journal_urls).append(pdf)
+
+    # Plenty of OA records publish only a landing page, so keep that as a
+    # manual last resort rather than a download candidate.
+    pdf_urls = []
+    for candidate in (*repo_urls, best.get("pdf_url"), *journal_urls, oa.get("oa_url")):
+        if candidate and candidate not in pdf_urls:
+            pdf_urls.append(candidate)
+
+    return {
+        "is_oa": bool(oa.get("is_oa")),
+        "oa_status": oa.get("oa_status") or "closed",
+        "pdf_urls": pdf_urls,
+        "landing_url": best.get("landing_page_url") or oa.get("oa_url"),
+        "title": work.get("title") or "",
+        "year": work.get("publication_year"),
+        "authors": [
+            a["author"]["display_name"]
+            for a in (work.get("authorships") or [])
+            if (a.get("author") or {}).get("display_name")
+        ],
+    }
+
+
+def build_filename(doi: str, meta: dict | None) -> str:
+    """Readable Author_Year_Title name when metadata allows, else the DOI."""
+    if meta and meta.get("authors") and meta.get("year"):
+        surname = meta["authors"][0].split()[-1]
+        words = re.sub(r"[^\w\s-]", "", meta.get("title", "")).split()
+        stem = f"{surname}_{meta['year']}_{'-'.join(words[:8])}".strip("_-")
+        stem = re.sub(r"[^\w\-.]", "_", stem)[:120]
+        if stem:
+            return f"{stem}.pdf"
+    return f"{re.sub(r'[^\w\-.]', '_', doi)}.pdf"
+
+
+# --- Sci-Hub Downloader ---
+
+
+def download_paper(
+    doi: str, output_dir: str, scihub_url: str, filename: str = None, log_callback=None
+) -> bool:
     """Download a single paper by DOI from Sci-Hub. Returns True on success."""
 
     def log(msg):
@@ -159,47 +284,62 @@ def download_paper(doi: str, output_dir: str, scihub_url: str, log_callback=None
 
     log(f"  Downloading PDF: {pdf_url[:80]}...")
 
-    try:
-        pdf_resp = session.get(pdf_url, timeout=PDF_DOWNLOAD_TIMEOUT, stream=True)
-        pdf_resp.raise_for_status()
-    except requests.RequestException as e:
-        log(f"  ERROR downloading PDF: {e}")
-        return False
+    filepath = os.path.join(output_dir, filename or build_filename(doi, None))
+    return _save_pdf(session, pdf_url, filepath, log)
 
-    # Check that we actually got a PDF
-    content_type = pdf_resp.headers.get("Content-Type", "")
-    if "pdf" not in content_type and not pdf_url.endswith(".pdf"):
-        log(f"  WARNING: Response may not be a PDF (Content-Type: {content_type})")
 
-    # Build filename from DOI
-    safe_doi = re.sub(r'[^\w\-.]', '_', doi)
-    filename = f"{safe_doi}.pdf"
-    filepath = os.path.join(output_dir, filename)
+# --- Orchestration ---
 
-    with open(filepath, "wb") as f:
-        for chunk in pdf_resp.iter_content(chunk_size=8192):
-            f.write(chunk)
 
-    # An error page or CAPTCHA is easily bigger than 1 KB, so size alone can't
-    # tell us this is a PDF — check the file signature and drop anything else,
-    # rather than leaving a broken .pdf that looks downloaded.
-    with open(filepath, "rb") as f:
-        header = f.read(5)
+def fetch_paper(
+    doi: str,
+    output_dir: str,
+    scihub_url: str,
+    use_open_access: bool = True,
+    log_callback=None,
+) -> str:
+    """Fetch one paper, preferring a legal open-access copy.
 
-    file_size = os.path.getsize(filepath)
+    Returns "oa", "scihub", or "" when nothing could be downloaded.
+    """
 
-    if header != b"%PDF-":
-        log("  ERROR: Not a PDF (likely an error page or CAPTCHA) — discarded.")
-        os.remove(filepath)
-        return False
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
 
-    if file_size < 1024:
-        log(f"  WARNING: File very small ({file_size} bytes) — discarded.")
-        os.remove(filepath)
-        return False
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-    log(f"  Saved: {filename} ({file_size / 1024:.0f} KB)")
-    return True
+    meta = None
+    if use_open_access:
+        meta = lookup_open_access(doi, session, log)
+        if meta is None:
+            log("  [OA] Not indexed by OpenAlex.")
+        elif meta["is_oa"]:
+            log(f"  [OA] Open access ({meta['oa_status']}) — trying legal copy.")
+            filename = build_filename(doi, meta)
+            for pdf_url in meta["pdf_urls"]:
+                log(f"  [OA] Trying: {pdf_url[:80]}")
+                if _save_pdf(session, pdf_url, os.path.join(output_dir, filename), log):
+                    return "oa"
+            if meta.get("landing_url"):
+                # Either the publisher blocked us or the repository renders its
+                # download button in JavaScript. A legal copy is still there, so
+                # hand over the link instead of silently moving on.
+                log(f"  [OA] Legal copy exists, fetch by hand: {meta['landing_url']}")
+        else:
+            log("  [OA] No open-access copy indexed.")
+
+    log("  [SH] Falling back to Sci-Hub.")
+    if download_paper(
+        doi,
+        output_dir,
+        scihub_url,
+        filename=build_filename(doi, meta),
+        log_callback=log_callback,
+    ):
+        return "scihub"
+    return ""
 
 
 # --- GUI Application ---
@@ -246,6 +386,17 @@ class SciHubDaemonApp:
         ttk.Label(settings_frame, text="Delay (s):").pack(side=tk.LEFT, padx=(20, 0))
         self.delay_var = tk.StringVar(value="3")
         ttk.Spinbox(settings_frame, textvariable=self.delay_var, from_=1, to=30, width=4).pack(side=tk.LEFT, padx=5)
+
+        # --- Source preference ---
+        source_frame = ttk.Frame(self.root)
+        source_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+
+        self.oa_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            source_frame,
+            text="Try open access first (OpenAlex), fall back to Sci-Hub",
+            variable=self.oa_var,
+        ).pack(side=tk.LEFT)
 
         # --- Buttons ---
         btn_frame = ttk.Frame(self.root)
@@ -372,7 +523,9 @@ class SciHubDaemonApp:
         success = 0
         failed = 0
         failed_dois = []
+        by_source = {"oa": 0, "scihub": 0}
         scihub_url = self.scihub_var.get().rstrip("/")
+        use_oa = self.oa_var.get()
         delay = max(1, int(self.delay_var.get()))
 
         self.root.after(0, lambda: self.progress_bar.configure(maximum=total, value=0))
@@ -392,21 +545,22 @@ class SciHubDaemonApp:
 
             # Submit download to executor with hard timeout
             future = executor.submit(
-                download_paper, doi, output_dir, scihub_url, log_callback=self._log
+                fetch_paper, doi, output_dir, scihub_url, use_oa, log_callback=self._log
             )
 
             try:
-                ok = future.result(timeout=HARD_TIMEOUT_PER_ITEM)
+                source = future.result(timeout=HARD_TIMEOUT_PER_ITEM)
             except FuturesTimeoutError:
                 future.cancel()
                 self._log(f"  TIMEOUT: Download exceeded {HARD_TIMEOUT_PER_ITEM}s — skipping.")
-                ok = False
+                source = ""
             except Exception as e:
                 self._log(f"  UNEXPECTED ERROR: {e}")
-                ok = False
+                source = ""
 
-            if ok:
+            if source:
                 success += 1
+                by_source[source] += 1
             else:
                 failed += 1
                 failed_dois.append(doi)
@@ -437,7 +591,11 @@ class SciHubDaemonApp:
 
         self.failed_dois = failed_dois
 
-        self._log(f"\nDone! Success: {success}, Failed: {failed}, Total: {total}")
+        self._log(
+            f"\nDone! Success: {success} "
+            f"(open access: {by_source['oa']}, Sci-Hub: {by_source['scihub']}), "
+            f"Failed: {failed}, Total: {total}"
+        )
         self._log(f"Files saved to: {output_dir}")
         if failed_dois:
             self._log(f"\nFailed DOIs ({len(failed_dois)}):")
