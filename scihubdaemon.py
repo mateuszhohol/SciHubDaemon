@@ -5,7 +5,7 @@ SciHubDaemon - Batch DOI extractor and Sci-Hub downloader.
 Paste bibliographic descriptions, extract DOIs, download full papers from Sci-Hub.
 """
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 
 import re
 import os
@@ -14,27 +14,59 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 
 import requests
 from bs4 import BeautifulSoup
 
 # --- DOI Extraction ---
 
+# Match as much as possible, then trim the tail below. Commas and quotes are
+# the only separators excluded up front — they never occur inside a real DOI,
+# but ";" ")" "]" and ">" all do (see the SICI format), so they can't be.
 DOI_REGEX = re.compile(
-    r'\b(10\.\d{4,9}/[^\s,;}\]\"\']+[^\s,;}\]\"\'.])',
+    r'\b10\.\d{4,9}/[^\s,\"\']+',
     re.IGNORECASE,
 )
 
+# Closing brackets that may legitimately appear inside a DOI — old Wiley/SICI
+# DOIs look like 10.1002/(SICI)1097-0193(1999)8:4<194::AID-HBM4>3.0.CO;2-C —
+# so these are only stripped when they have no matching opener.
+_CLOSERS = {")": "(", "]": "[", "}": "{", ">": "<"}
+# Punctuation that prose glues onto a DOI but is never part of one.
+_TRAILING_PUNCT = ".,;:\"'"
+
+
+def _trim_doi(doi: str) -> str:
+    """Strip trailing punctuation the surrounding text glued onto a DOI."""
+    while doi:
+        last = doi[-1]
+        if last in _TRAILING_PUNCT:
+            doi = doi[:-1]
+        elif last in _CLOSERS:
+            if doi.count(_CLOSERS[last]) >= doi.count(last):
+                break  # balanced — the bracket belongs to the DOI
+            doi = doi[:-1]
+        else:
+            break
+    return doi
+
 
 def extract_dois(text: str) -> list[str]:
-    """Extract unique DOIs from text, preserving order."""
+    """Extract unique DOIs from text, preserving order.
+
+    DOIs are case-insensitive per spec, so entries differing only in case are
+    collapsed onto the first spelling seen.
+    """
     seen = set()
     dois = []
     for match in DOI_REGEX.finditer(text):
-        doi = match.group(1).rstrip(".")
-        if doi not in seen:
-            seen.add(doi)
+        doi = _trim_doi(match.group(0))
+        if not doi.partition("/")[2]:
+            continue  # nothing left after the slash once trimmed
+        key = doi.lower()
+        if key not in seen:
+            seen.add(key)
             dois.append(doi)
     return dois
 
@@ -71,7 +103,8 @@ def download_paper(doi: str, output_dir: str, scihub_url: str, log_callback=None
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    url = f"{scihub_url}/{doi}"
+    # SICI-style DOIs carry "<", ">" and "#", which are invalid raw in a path.
+    url = f"{scihub_url}/{quote(doi, safe='/()')}"
     log(f"  Requesting: {url}")
 
     try:
@@ -147,9 +180,22 @@ def download_paper(doi: str, output_dir: str, scihub_url: str, log_callback=None
         for chunk in pdf_resp.iter_content(chunk_size=8192):
             f.write(chunk)
 
+    # An error page or CAPTCHA is easily bigger than 1 KB, so size alone can't
+    # tell us this is a PDF — check the file signature and drop anything else,
+    # rather than leaving a broken .pdf that looks downloaded.
+    with open(filepath, "rb") as f:
+        header = f.read(5)
+
     file_size = os.path.getsize(filepath)
+
+    if header != b"%PDF-":
+        log("  ERROR: Not a PDF (likely an error page or CAPTCHA) — discarded.")
+        os.remove(filepath)
+        return False
+
     if file_size < 1024:
-        log(f"  WARNING: File very small ({file_size} bytes), may not be valid PDF.")
+        log(f"  WARNING: File very small ({file_size} bytes) — discarded.")
+        os.remove(filepath)
         return False
 
     log(f"  Saved: {filename} ({file_size / 1024:.0f} KB)")
