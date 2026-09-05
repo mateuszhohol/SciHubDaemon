@@ -1,0 +1,62 @@
+name: Build Windows
+
+# PyInstaller cannot cross-compile, so the .exe has to be built on Windows.
+# Publishing a release runs this job on a GitHub-hosted Windows machine and
+# attaches the result to that same release, alongside the macOS build.
+on:
+  release:
+    types: [published]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to attach the build to a release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 pyinstaller
+
+      # Run before building: a broken build is easier to read as a failed test
+      # than as a mysteriously misbehaving .exe. This also exercises the code
+      # on Windows itself, which is the platform being shipped.
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build .exe
+        run: >
+          pyinstaller --name SciHubDaemon --windowed --icon=icon.ico
+          --noconfirm scihubdaemon.py
+
+      - name: Check the executable exists
+        shell: pwsh
+        run: |
+          $exe = "dist/SciHubDaemon/SciHubDaemon.exe"
+          if (-not (Test-Path $exe)) { throw "Build produced no .exe at $exe" }
+          "Built: {0:N1} MB" -f ((Get-Item $exe).Length / 1MB)
+
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path dist/SciHubDaemon -DestinationPath SciHubDaemon-Windows.zip
+
+      # Kept for every run, so a pull request can be downloaded and tried out
+      # on a real Windows machine before it is merged.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SciHubDaemon-Windows
+          path: SciHubDaemon-Windows.zip
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        run: gh release upload "${{ github.event.release.tag_name }}" SciHubDaemon-Windows.zip --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
