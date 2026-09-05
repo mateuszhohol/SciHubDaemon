@@ -6,7 +6,7 @@ Paste bibliographic descriptions, extract DOIs, download full papers. Legal
 open-access copies are looked up first via OpenAlex, with Sci-Hub as fallback.
 """
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 import re
 import os
@@ -15,7 +15,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -141,6 +141,43 @@ OPENALEX_API = "https://api.openalex.org/works/doi:"
 OPENALEX_CONTACT = ""
 OPENALEX_TIMEOUT = (10, 20)
 
+# DSpace 7 repositories publish /bitstreams/<uuid>/download, but that path is a
+# route in their Angular front end: fetching it returns ~900 KB of app shell,
+# never the file. The REST API behind it serves the actual PDF.
+_DSPACE_BITSTREAM = re.compile(
+    r"^(https?://[^/]+)/bitstreams/([0-9a-f-]{36})/download/?$", re.IGNORECASE
+)
+
+# OSF-hosted preprints (PsyArXiv and friends) map onto a predictable download
+# URL. The version suffix belongs to the DOI, not to the OSF identifier, so
+# 10.31234/osf.io/xw4jr_v1 is served at https://osf.io/xw4jr/download.
+_OSF_DOI = re.compile(r"^10\.\d{4,9}/osf\.io/([a-z0-9]+?)(?:_v\d+)?$", re.IGNORECASE)
+
+# doi.org links resolve to a publisher landing page, never to a PDF, so they
+# are worth keeping as a manual link but never worth downloading.
+_RESOLVER_HOSTS = {"doi.org", "dx.doi.org"}
+
+
+def _normalize_pdf_url(url: str) -> str:
+    """Rewrite known front-end routes into the endpoint that serves the file."""
+    match = _DSPACE_BITSTREAM.match(url)
+    if match:
+        return f"{match.group(1)}/server/api/core/bitstreams/{match.group(2)}/content"
+    return url
+
+
+def _is_doi_resolver(url: str) -> bool:
+    return urlparse(url).netloc.lower().removeprefix("www.") in _RESOLVER_HOSTS
+
+
+def osf_pdf_url(doi: str) -> str | None:
+    """Direct download URL for an OSF-hosted preprint, if the DOI is one.
+
+    Works even when OpenAlex has no record of the preprint.
+    """
+    match = _OSF_DOI.match(doi)
+    return f"https://osf.io/{match.group(1)}/download" if match else None
+
 
 def lookup_open_access(doi: str, session, log) -> dict | None:
     """Ask OpenAlex whether a legal free copy of `doi` exists.
@@ -183,7 +220,10 @@ def lookup_open_access(doi: str, session, log) -> dict | None:
     # manual last resort rather than a download candidate.
     pdf_urls = []
     for candidate in (*repo_urls, best.get("pdf_url"), *journal_urls, oa.get("oa_url")):
-        if candidate and candidate not in pdf_urls:
+        if not candidate or _is_doi_resolver(candidate):
+            continue
+        candidate = _normalize_pdf_url(candidate)
+        if candidate not in pdf_urls:
             pdf_urls.append(candidate)
 
     return {
@@ -313,22 +353,32 @@ def fetch_paper(
     meta = None
     if use_open_access:
         meta = lookup_open_access(doi, session, log)
+
+        candidates = list(meta["pdf_urls"]) if meta and meta["is_oa"] else []
+        # An OSF preprint is reachable from its DOI alone, so this still works
+        # when OpenAlex has no record of it.
+        osf_url = osf_pdf_url(doi)
+        if osf_url and osf_url not in candidates:
+            candidates.append(osf_url)
+
         if meta is None:
             log("  [OA] Not indexed by OpenAlex.")
         elif meta["is_oa"]:
             log(f"  [OA] Open access ({meta['oa_status']}) — trying legal copy.")
-            filename = build_filename(doi, meta)
-            for pdf_url in meta["pdf_urls"]:
-                log(f"  [OA] Trying: {pdf_url[:80]}")
-                if _save_pdf(session, pdf_url, os.path.join(output_dir, filename), log):
-                    return "oa"
-            if meta.get("landing_url"):
-                # Either the publisher blocked us or the repository renders its
-                # download button in JavaScript. A legal copy is still there, so
-                # hand over the link instead of silently moving on.
-                log(f"  [OA] Legal copy exists, fetch by hand: {meta['landing_url']}")
         else:
             log("  [OA] No open-access copy indexed.")
+
+        filename = build_filename(doi, meta)
+        for pdf_url in candidates:
+            log(f"  [OA] Trying: {pdf_url[:80]}")
+            if _save_pdf(session, pdf_url, os.path.join(output_dir, filename), log):
+                return "oa"
+
+        if meta and meta.get("landing_url"):
+            # Either the publisher blocked us or the repository renders its
+            # download button in JavaScript. A legal copy is still there, so
+            # hand over the link instead of silently moving on.
+            log(f"  [OA] Legal copy exists, fetch by hand: {meta['landing_url']}")
 
     log("  [SH] Falling back to Sci-Hub.")
     if download_paper(
