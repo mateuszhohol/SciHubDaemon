@@ -10,7 +10,6 @@ VERSION = "2.1.1"
 
 import re
 import os
-import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import tkinter as tk

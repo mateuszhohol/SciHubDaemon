@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 build/
 dist/
+# PyInstaller generates a .spec on every specless run — ignore those, but keep
+# the hand-tuned macOS recipe, which is the only record of how the .app is built.
 *.spec
+!SciHubDaemon-macOS.spec
 .DS_Store
 .claude/
